@@ -44,13 +44,22 @@ public class EndSkyRenderer implements AutoCloseable {
     @Nullable
     private AbstractTexture starsTexture;
 
-    private final GpuBuffer nebula1;
-    private final GpuBuffer nebula2;
-    private final GpuBuffer horizon;
-    private final GpuBuffer stars1;
-    private final GpuBuffer stars2;
-    private final GpuBuffer stars3;
-    private final GpuBuffer stars4;
+    /// A sky mesh on the GPU together with the number of indices needed to draw it.
+    private record SkyMesh(GpuBuffer buffer, int indexCount) {
+        boolean isUsable() {
+            return !buffer.isClosed();
+        }
+    }
+
+    // Built lazily and rebuilt when closed: since 26.3 vanilla closes and recreates the
+    // SkyRenderer during the game (e.g. after a resource reload), which also closes these.
+    @Nullable private SkyMesh nebula1;
+    @Nullable private SkyMesh nebula2;
+    @Nullable private SkyMesh horizon;
+    @Nullable private SkyMesh stars1;
+    @Nullable private SkyMesh stars2;
+    @Nullable private SkyMesh stars3;
+    @Nullable private SkyMesh stars4;
     private final Vector3f axis1;
     private final Vector3f axis2;
     private final Vector3f axis3;
@@ -60,13 +69,6 @@ public class EndSkyRenderer implements AutoCloseable {
 
     public EndSkyRenderer() {
         client = Minecraft.getInstance();
-        stars1 = buildBuffer(0.1f, 0.30f, 3500, 41315, DefaultVertexFormat.POSITION, this::makeStars);
-        stars2 = buildBuffer(0.1f, 0.35f, 2000, 35151, DefaultVertexFormat.POSITION, this::makeStars);
-        stars3 = buildBuffer(0.4f, 1.2f, 1000, 61354, this::makeUVStars);
-        stars4 = buildBuffer(0.4f, 1.2f, 1000, 61355, this::makeUVStars);
-        nebula1 = buildBuffer(40, 60, 30, 11515, this::makeFarFog);
-        nebula2 = buildBuffer(40, 60, 10, 14151, this::makeFarFog);
-        horizon = buildBufferHorizon();
 
         RandomSource random = RandomSource.createThreadLocalInstance();
         axis1 = new Vector3f(random.nextFloat(), random.nextFloat(), random.nextFloat());
@@ -77,6 +79,20 @@ public class EndSkyRenderer implements AutoCloseable {
         axis2.normalize();
         axis3.normalize();
         axis4.normalize();
+    }
+
+    private static boolean needsBuild(@Nullable SkyMesh mesh) {
+        return mesh == null || !mesh.isUsable();
+    }
+
+    private void ensureBuffers() {
+        if (needsBuild(stars1)) stars1 = buildBuffer(0.1f, 0.30f, 3500, 41315, DefaultVertexFormat.POSITION, this::makeStars);
+        if (needsBuild(stars2)) stars2 = buildBuffer(0.1f, 0.35f, 2000, 35151, DefaultVertexFormat.POSITION, this::makeStars);
+        if (needsBuild(stars3)) stars3 = buildBuffer(0.4f, 1.2f, 1000, 61354, this::makeUVStars);
+        if (needsBuild(stars4)) stars4 = buildBuffer(0.4f, 1.2f, 1000, 61355, this::makeUVStars);
+        if (needsBuild(nebula1)) nebula1 = buildBuffer(40, 60, 30, 11515, this::makeFarFog);
+        if (needsBuild(nebula2)) nebula2 = buildBuffer(40, 60, 10, 14151, this::makeFarFog);
+        if (needsBuild(horizon)) horizon = buildBufferHorizon();
     }
 
     public void initTextures() {
@@ -97,6 +113,11 @@ public class EndSkyRenderer implements AutoCloseable {
 
     @SuppressWarnings("DataFlowIssue")
     public void render(EndSkyRenderState state, RenderPass renderPass) {
+        ensureBuffers();
+        if (nebula1Texture == null || nebula2Texture == null || horizonTexture == null || starsTexture == null) {
+            initTextures();
+        }
+
         PoseStack matrices = new PoseStack();
         matrices.mulPose(RenderSystem.getModelViewStack());
 
@@ -152,7 +173,7 @@ public class EndSkyRenderer implements AutoCloseable {
             RenderPass renderPass,
             PoseStack matrices,
             AbstractTexture texture,
-            GpuBuffer vertexBuffer,
+            SkyMesh mesh,
             RenderPipeline pipeline,
             float r,
             float g,
@@ -160,7 +181,8 @@ public class EndSkyRenderer implements AutoCloseable {
             float a
     ) {
         var autoBuf = RenderSystem.getSequentialBuffer(PrimitiveTopology.QUADS);
-        GpuBuffer indexBuffer = autoBuf.getBuffer((int) vertexBuffer.size());
+        if (mesh.indexCount() <= 0) return;
+        GpuBuffer indexBuffer = autoBuf.getBuffer(mesh.indexCount());
         var dynamicTransforms = RenderSystem.getDynamicUniforms()
                 .writeTransform(matrices.last().pose(), new Vector4f(r, g, b, a));
 
@@ -169,13 +191,13 @@ public class EndSkyRenderer implements AutoCloseable {
         RenderSystem.bindDefaultUniforms(renderPass);
         renderPass.setUniform("DynamicTransforms", dynamicTransforms);
         renderPass.setUniform("Sampler0", texture.getTextureView(), texture.getSampler());
-        renderPass.setVertexBuffer(0, vertexBuffer.slice());
+        renderPass.setVertexBuffer(0, mesh.buffer().slice());
         renderPass.setIndexBuffer(indexBuffer, autoBuf.type());
-        renderPass.drawIndexed((int) vertexBuffer.size(), 1, 0, 0, 0);
+        renderPass.drawIndexed(mesh.indexCount(), 1, 0, 0, 0);
         renderPass.popDebugGroup();
     }
 
-    private GpuBuffer buildBuffer(
+    private SkyMesh buildBuffer(
             float minSize,
             float maxSize,
             int count,
@@ -184,24 +206,27 @@ public class EndSkyRenderer implements AutoCloseable {
             BufferFunction fkt
     ) {
         var primitive = PrimitiveTopology.QUADS;
-        GpuBuffer var10;
+        SkyMesh var10;
         try (ByteBufferBuilder byteBufferBuilder = new ByteBufferBuilder(primitive.primitiveLength * count * 4)) {
             BufferBuilder bufferBuilder = new BufferBuilder(byteBufferBuilder, primitive, format);
             fkt.make(bufferBuilder, minSize, maxSize, count, seed);
             try (MeshData meshData = bufferBuilder.buildOrThrow()) {
-                var10 = RenderSystem.getDevice().createBuffer(() -> "Better End Sky vertex buffer", 40, meshData.vertexBuffer());
+                var10 = new SkyMesh(
+                        RenderSystem.getDevice().createBuffer(() -> "Better End Sky vertex buffer", 40, meshData.vertexBuffer()),
+                        meshData.drawState().indexCount()
+                );
             }
         }
         return var10;
     }
 
-    private GpuBuffer buildBuffer(
+    private SkyMesh buildBuffer(
             float minSize, float maxSize, int count, long seed, BufferFunction fkt
     ) {
         return buildBuffer(minSize, maxSize, count, seed, DefaultVertexFormat.POSITION_TEX_COLOR, fkt);
     }
 
-    private GpuBuffer buildBufferHorizon() {
+    private SkyMesh buildBufferHorizon() {
         return buildBuffer(
                 0, 0, 0, 0,
                 (_builder, _minSize, _maxSize, _count, _seed) -> makeCylinder(_builder, 16, 50, 180)
@@ -373,13 +398,18 @@ public class EndSkyRenderer implements AutoCloseable {
 
     @Override
     public void close() {
-        nebula1.close();
-        nebula2.close();
-        horizon.close();
-        stars1.close();
-        stars2.close();
-        stars3.close();
-        stars4.close();
+        closeMesh(nebula1);
+        closeMesh(nebula2);
+        closeMesh(horizon);
+        closeMesh(stars1);
+        closeMesh(stars2);
+        closeMesh(stars3);
+        closeMesh(stars4);
+        nebula1 = nebula2 = horizon = stars1 = stars2 = stars3 = stars4 = null;
+    }
+
+    private static void closeMesh(@Nullable SkyMesh mesh) {
+        if (mesh != null && mesh.isUsable()) mesh.buffer().close();
     }
 
 }
