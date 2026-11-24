@@ -4,6 +4,10 @@ on: [ pull_request, push, workflow_dispatch ]
 jobs:
   build:
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     steps:
       - name: checkout repository
         uses: actions/checkout@v6
@@ -24,3 +28,8 @@ jobs:
           name: Artifacts
           path: build/libs/
           retention-days: 14
+      - name: Attest build provenance
+        if: github.event_name != 'pull_request'
+        uses: actions/attest@v4
+        with:
+          subject-path: 'build/libs/*.jar'
